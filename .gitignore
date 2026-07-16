@@ -1,0 +1,15 @@
+.spectra/
+openspec/.vector-search.db*
+.venv/
+.venv-transcribe/
+.env
+__pycache__/
+*.pyc
+data/state.json
+data/*.sqlite3
+data/pipeline.log
+data/transcribe_progress.json
+data/scan_snapshot.json
+data/pipeline.lock
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
