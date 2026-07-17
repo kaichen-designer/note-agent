@@ -187,6 +187,27 @@ class StringShapedListTests(unittest.TestCase):
         )
         self.assertEqual(note.key_points, ["重點一", "重點二"])
 
+    def test_parameter_wrapped_json_array_is_recovered(self):
+        """Regression: the model sometimes leaks its own tool-call-like
+        markup as the field value instead of a real array (observed in
+        production 2026-07-16, e.g. `<parameter name="items">["a","b"]`
+        with no closing tag). The literal JSON array embedded in the
+        string must be recovered rather than treated as one giant line."""
+        from notion_agent import parse_structured_note
+
+        note = parse_structured_note(
+            {
+                "title": "T", "summary": "S",
+                "key_points": '<parameter name="items">["重點一","重點二"]',
+                "action_items": '<parameter name="items">["待辦一","待辦二"]</parameter>',
+                "category_tag": "學習",
+            },
+            fallback_title="x.m4a",
+            transcript="t",
+        )
+        self.assertEqual(note.key_points, ["重點一", "重點二"])
+        self.assertEqual(note.action_items, ["待辦一", "待辦二"])
+
 
 if __name__ == "__main__":
     unittest.main()

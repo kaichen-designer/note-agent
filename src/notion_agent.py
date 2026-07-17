@@ -98,13 +98,26 @@ def parse_structured_note(data: dict, fallback_title: str, transcript: str) -> S
             return [str(item).strip() for item in value if str(item).strip()]
         if isinstance(value, str) and value.strip():
             # The model sometimes serializes array fields as a single string
-            # of <item>...</item> chunks (observed in production). Recover
-            # those; otherwise fall back to splitting on lines.
+            # instead of a real array. Two malformed shapes have been
+            # observed in production: a string of <item>...</item> chunks,
+            # and its own tool-call-like markup leaking into the value with
+            # a JSON array embedded inside (e.g. `<parameter name="items">
+            # ["a","b"]`, sometimes missing the closing tag). Recover
+            # whichever shape appears before falling back to line-splitting.
+            import json
             import re
 
             items = re.findall(r"<item>(.*?)</item>", value, re.DOTALL)
             if items:
                 return [item.strip() for item in items if item.strip()]
+            array_match = re.search(r"\[.*\]", value, re.DOTALL)
+            if array_match:
+                try:
+                    parsed = json.loads(array_match.group(0))
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, list):
+                    return [str(item).strip() for item in parsed if str(item).strip()]
             lines = [line.strip(" \t-•*") for line in value.splitlines()]
             return [line for line in lines if line]
         return []
