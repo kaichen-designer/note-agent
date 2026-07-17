@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -42,17 +43,62 @@ def _register_cuda_dll_dirs() -> None:
         os.environ["PATH"] = os.pathsep.join(bin_dirs) + os.pathsep + os.environ.get("PATH", "")
 
 
+# Refresh cadence for the heartbeat thread. Must stay well under the
+# viewer's FRESH_SECONDS (show_progress.py) so a live worker is never
+# mistaken for a dead one.
+HEARTBEAT_SECONDS = 5
+
+# Last payload written, shared with the heartbeat thread. The lock also
+# serializes the file writes themselves so the viewer never reads a
+# torn/interleaved JSON document.
+_progress_lock = threading.Lock()
+_latest_progress: dict | None = None
+
+
 def _write_progress(progress_path: str | None, payload: dict) -> None:
     """Best-effort progress write; progress must never break transcription."""
+    global _latest_progress
     if not progress_path:
         return
-    try:
-        payload["updated_at"] = time.time()
-        Path(progress_path).write_text(
-            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
-        )
-    except OSError:
-        pass
+    with _progress_lock:
+        _latest_progress = dict(payload)
+        try:
+            payload["updated_at"] = time.time()
+            Path(progress_path).write_text(
+                json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+            )
+        except OSError:
+            pass
+
+
+def _start_heartbeat(
+    progress_path: str, interval: float = HEARTBEAT_SECONDS
+) -> threading.Event:
+    """Keep re-stamping updated_at on the last progress payload so the file
+    only goes stale when this process is actually gone. Model loading and
+    model.transcribe()'s eager audio decode + VAD scan can stay silent for
+    many minutes on multi-GB recordings; without a heartbeat the viewer
+    cannot tell that from a crashed worker. Daemon thread: it dies with the
+    process, which is exactly what makes staleness meaningful. Returns a
+    stop event (used by tests; production just lets it run to exit)."""
+
+    def _beat() -> None:
+        while not stop.wait(interval):
+            with _progress_lock:
+                if _latest_progress is None:
+                    continue
+                payload = dict(_latest_progress)
+                payload["updated_at"] = time.time()
+                try:
+                    Path(progress_path).write_text(
+                        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+                    )
+                except OSError:
+                    pass
+
+    stop = threading.Event()
+    threading.Thread(target=_beat, daemon=True).start()
+    return stop
 
 
 def main() -> int:
@@ -77,10 +123,16 @@ def main() -> int:
         print(json.dumps({"error": f"faster-whisper unavailable: {exc}"}))
         return 1
 
+    if progress_path:
+        _start_heartbeat(progress_path)
     _write_progress(progress_path, {"phase": "loading_model", "file": filename, "percent": 0.0})
 
     try:
         model = WhisperModel(model_size, device="auto", compute_type="auto")
+        # transcribe() eagerly decodes the audio and runs VAD before yielding
+        # any segment -- on multi-GB recordings this is the longest silent
+        # stretch, so give the viewer a phase of its own for it.
+        _write_progress(progress_path, {"phase": "preparing_audio", "file": filename, "percent": 0.0})
         segments, info = model.transcribe(audio_path, vad_filter=vad_filter)
         duration = float(info.duration or 0)
 

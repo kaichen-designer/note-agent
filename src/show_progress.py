@@ -13,10 +13,20 @@ import sys
 import time
 from pathlib import Path
 
+if hasattr(sys.stdout, "reconfigure"):
+    # UTF-8 when stdout is piped/captured (a pipe falls back to the legacy
+    # codepage, mangling the Chinese status text); no effect on a real
+    # console, which Python drives through the Unicode API. Same pattern
+    # as diagnose.py and run_now.py.
+    sys.stdout.reconfigure(encoding="utf-8")
+
 PROGRESS_PATH = Path(__file__).resolve().parent.parent / "data" / "transcribe_progress.json"
 
-# A progress file not updated for this long means no transcription is
-# running (finished, crashed, or the machine rebooted mid-run).
+# The worker re-stamps the progress file every few seconds via a heartbeat
+# thread (HEARTBEAT_SECONDS in _transcribe_worker.py) even while it is
+# silently loading the model or decoding/VAD-scanning a huge recording, so
+# a file this old genuinely means the worker process is gone (finished,
+# crashed, or the machine rebooted mid-run) -- not merely busy.
 FRESH_SECONDS = 120
 
 BAR_WIDTH = 30
@@ -32,6 +42,11 @@ def _render(payload: dict) -> str:
     filename = payload.get("file", "?")
     if phase == "loading_model":
         return f"載入模型中... ({filename})"
+    if phase == "preparing_audio":
+        return (
+            f"前處理中(音訊解碼與靜音偵測): {filename}\n"
+            "大檔案這一步可能持續數分鐘以上,開始轉錄後才會出現進度條"
+        )
     if phase == "transcribing":
         percent = payload.get("percent", 0.0)
         done = payload.get("processed_sec", 0.0)
