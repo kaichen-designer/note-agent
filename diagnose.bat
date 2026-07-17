@@ -1,6 +1,6 @@
 @echo off
 rem One-shot pipeline health check: lock status, progress, failed files, recent log.
-chcp 65001 >nul
+rem ASCII only, no chcp: see the docstring in src\run_now.py for why.
 cd /d "%~dp0"
 ".venv\Scripts\python.exe" "src\diagnose.py"
 pause
