@@ -227,6 +227,25 @@ class StringShapedListTests(unittest.TestCase):
         self.assertEqual(note.key_points, ["重點一", "重點二"])
         self.assertEqual(note.action_items, ["待辦一"])
 
+    def test_novel_tag_name_is_still_recovered(self):
+        """The tag-pair recovery must not be hard-coded to tag names seen so
+        far (item, li) -- any consistent <tag>...</tag> wrapping, including
+        one never observed before, should be recognized generically."""
+        from notion_agent import parse_structured_note
+
+        note = parse_structured_note(
+            {
+                "title": "T", "summary": "S",
+                "key_points": "<bullet>重點一</bullet><bullet>重點二</bullet>",
+                "action_items": "<point>待辦一</point>",
+                "category_tag": "會議",
+            },
+            fallback_title="x.m4a",
+            transcript="t",
+        )
+        self.assertEqual(note.key_points, ["重點一", "重點二"])
+        self.assertEqual(note.action_items, ["待辦一"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,10 +7,13 @@ rejected in favor of this simpler, fully headless approach.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import anthropic
 from notion_client import Client
+
+_log = logging.getLogger("pipeline")
 
 from notion_schema import (
     CATEGORY_TAG_OPTIONS,
@@ -125,17 +128,26 @@ def parse_structured_note(data: dict, fallback_title: str, transcript: str) -> S
             # The model sometimes serializes array fields as a single string
             # instead of a real array. Malformed shapes observed in
             # production: a string of <item>...</item> or <li>...</li>
-            # chunks (optionally wrapped in a <list>...</list> container),
-            # and its own tool-call-like markup leaking into the value with
-            # a JSON array embedded inside (e.g. `<parameter name="items">
-            # ["a","b"]`, sometimes missing the closing tag). Recover
-            # whichever shape appears before falling back to line-splitting.
+            # chunks (optionally wrapped in a container tag like
+            # <list>...</list>), and its own tool-call-like markup leaking
+            # into the value with a JSON array embedded inside (e.g.
+            # `<parameter name="items">["a","b"]`, sometimes missing the
+            # closing tag). Recover whichever shape appears before falling
+            # back to line-splitting. New tag names keep showing up (item,
+            # li, ...), so match any matching open/close tag pair generically
+            # instead of hard-coding the ones seen so far.
             import json
             import re
 
-            items = re.findall(r"<(?:item|li)>(.*?)</(?:item|li)>", value, re.DOTALL)
+            # [^<>]* (no nested angle brackets) deliberately excludes a
+            # container wrapper like <list>...</list> from matching -- its
+            # content contains further tags -- so this only ever picks up
+            # leaf items regardless of what the container/item tag names are.
+            items = re.findall(r"<(\w+)>([^<>]*)</\1>", value, re.DOTALL)
+            items = [content.strip() for _tag, content in items if content.strip()]
             if items:
-                return [item.strip() for item in items if item.strip()]
+                _log.warning("structuring output used <tag>-wrapped string list instead of array; recovered %d item(s)", len(items))
+                return items
             array_match = re.search(r"\[.*\]", value, re.DOTALL)
             if array_match:
                 try:
@@ -143,11 +155,15 @@ def parse_structured_note(data: dict, fallback_title: str, transcript: str) -> S
                 except json.JSONDecodeError:
                     parsed = None
                 if isinstance(parsed, list):
+                    _log.warning("structuring output used JSON-array-in-string instead of array; recovered %d item(s)", len(parsed))
                     return [str(item).strip() for item in parsed if str(item).strip()]
+            _log.warning("structuring output used unrecognized string shape for a list field; falling back to line-splitting")
             lines = [line.strip(" \t-•*") for line in value.splitlines()]
-            # Drop stray container tags (e.g. "<list>", "</list>") that
-            # line-splitting alone would otherwise turn into bogus items.
-            lines = [line for line in lines if not re.fullmatch(r"</?\w+>", line)]
+            # Strip any leftover tags (whole-line container tags like
+            # "<list>", or tags still wrapping a line's content) so an
+            # unrecognized markup shape never leaks literal "<tag>" text
+            # into the Notion page.
+            lines = [re.sub(r"</?\w+>", "", line).strip() for line in lines]
             return [line for line in lines if line]
         return []
 
