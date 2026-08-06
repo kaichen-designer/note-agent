@@ -30,8 +30,28 @@ _STRUCTURE_TOOL = {
         "properties": {
             "title": {"type": "string", "description": "A short descriptive title for the note"},
             "summary": {"type": "string", "description": "A concise summary of the recording"},
-            "key_points": {"type": "array", "items": {"type": "string"}},
-            "action_items": {"type": "array", "items": {"type": "string"}},
+            "key_points": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Discussion points, decisions, and facts covered in the recording. "
+                    "Purely informational -- nobody needs to go do something as a direct "
+                    "result of the item. Do not include anything that also belongs in "
+                    "action_items."
+                ),
+            },
+            "action_items": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Concrete, actionable tasks someone must do after this recording -- "
+                    "each one should have an identifiable owner and/or deadline where the "
+                    "transcript mentions one (e.g. '[負責人] 於 [期限] 前完成 [任務]'). "
+                    "If the transcript names who is responsible or when it's due, include "
+                    "that in the item text. Every action item must be moved here, not left "
+                    "in key_points, even if it was also discussed as a topic."
+                ),
+            },
             "category_tag": {"type": "string", "enum": CATEGORY_TAG_OPTIONS},
         },
         "required": ["title", "summary", "key_points", "action_items", "category_tag"],
@@ -68,7 +88,12 @@ def structure_note(
                 "content": (
                     f"來源檔名:{source_filename}\n錄音日期:{recording_date}\n\n"
                     f"以下是一段錄音的逐字稿,請幫我整理成結構化筆記。"
-                    f"摘要請精簡(200字以內);重點以簡潔條列,約5~8條;行動項目具體可執行:\n\n{transcript}"
+                    f"摘要請精簡(200字以內);重點(key_points)以簡潔條列,約5~8條,"
+                    f"僅記錄討論內容、決策或事實,不含待辦事項;"
+                    f"行動項目(action_items)請具體可執行,並盡量包含負責人與期限"
+                    f"(逐字稿中有提到的話一定要寫進去,例如「[負責人]於[期限]前完成[任務]」)。"
+                    f"兩者互斥:任何屬於待辦性質的項目只能放在 action_items,"
+                    f"絕對不要同時出現在 key_points 裡:\n\n{transcript}"
                 ),
             }
         ],
