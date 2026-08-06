@@ -208,6 +208,25 @@ class StringShapedListTests(unittest.TestCase):
         self.assertEqual(note.key_points, ["重點一", "重點二"])
         self.assertEqual(note.action_items, ["待辦一", "待辦二"])
 
+    def test_list_wrapped_li_tagged_string_is_recovered(self):
+        """Regression: the model sometimes wraps <li> items in a <list>
+        container instead of <item> tags (observed in production
+        2026-08-06); the wrapper tags must not become bogus list items."""
+        from notion_agent import parse_structured_note
+
+        note = parse_structured_note(
+            {
+                "title": "T", "summary": "S",
+                "key_points": "<list>\n<li>重點一</li>\n<li>重點二</li>\n</list>",
+                "action_items": "<list>\n<li>待辦一</li>\n</list>",
+                "category_tag": "會議",
+            },
+            fallback_title="x.m4a",
+            transcript="t",
+        )
+        self.assertEqual(note.key_points, ["重點一", "重點二"])
+        self.assertEqual(note.action_items, ["待辦一"])
+
 
 if __name__ == "__main__":
     unittest.main()

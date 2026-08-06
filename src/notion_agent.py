@@ -123,8 +123,9 @@ def parse_structured_note(data: dict, fallback_title: str, transcript: str) -> S
             return [str(item).strip() for item in value if str(item).strip()]
         if isinstance(value, str) and value.strip():
             # The model sometimes serializes array fields as a single string
-            # instead of a real array. Two malformed shapes have been
-            # observed in production: a string of <item>...</item> chunks,
+            # instead of a real array. Malformed shapes observed in
+            # production: a string of <item>...</item> or <li>...</li>
+            # chunks (optionally wrapped in a <list>...</list> container),
             # and its own tool-call-like markup leaking into the value with
             # a JSON array embedded inside (e.g. `<parameter name="items">
             # ["a","b"]`, sometimes missing the closing tag). Recover
@@ -132,7 +133,7 @@ def parse_structured_note(data: dict, fallback_title: str, transcript: str) -> S
             import json
             import re
 
-            items = re.findall(r"<item>(.*?)</item>", value, re.DOTALL)
+            items = re.findall(r"<(?:item|li)>(.*?)</(?:item|li)>", value, re.DOTALL)
             if items:
                 return [item.strip() for item in items if item.strip()]
             array_match = re.search(r"\[.*\]", value, re.DOTALL)
@@ -144,6 +145,9 @@ def parse_structured_note(data: dict, fallback_title: str, transcript: str) -> S
                 if isinstance(parsed, list):
                     return [str(item).strip() for item in parsed if str(item).strip()]
             lines = [line.strip(" \t-•*") for line in value.splitlines()]
+            # Drop stray container tags (e.g. "<list>", "</list>") that
+            # line-splitting alone would otherwise turn into bogus items.
+            lines = [line for line in lines if not re.fullmatch(r"</?\w+>", line)]
             return [line for line in lines if line]
         return []
 
