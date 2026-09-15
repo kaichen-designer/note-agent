@@ -47,6 +47,8 @@ def _render(payload: dict) -> str:
             f"前處理中(音訊解碼與靜音偵測): {filename}\n"
             "大檔案這一步可能持續數分鐘以上,開始轉錄後才會出現進度條"
         )
+    if phase == "diarizing":
+        return f"語者分離中: {filename}\n這一步會分析錄音裡有幾位語者,可能持續數分鐘"
     if phase == "transcribing":
         percent = payload.get("percent", 0.0)
         done = payload.get("processed_sec", 0.0)

@@ -18,6 +18,8 @@ import threading
 import time
 from pathlib import Path
 
+from diarize import diarize_segments
+
 if hasattr(sys.stdout, "reconfigure"):
     # Force UTF-8 regardless of the invoking console's codepage. This process
     # is normally launched with its stdout piped to the parent (not a real
@@ -71,6 +73,65 @@ def _write_progress(progress_path: str | None, payload: dict) -> None:
             pass
 
 
+def _diarization_device() -> str:
+    """Pick the diarization pipeline's device. whisperx pulls in torch as a
+    transitive dependency, so this import is only safe once diarization is
+    actually enabled (see the deferred-import note on `diarize_segments`)."""
+    try:
+        import torch
+
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
+
+
+def _format_diarized_transcript(labeled_segments: list[dict]) -> str:
+    """Turn whisperx/pyannote-labeled segments into the transcript text,
+    prefixing each segment with a `[語者 X]` label. Speaker letters are
+    assigned in the order each distinct diarization speaker id first
+    appears, not from the (meaningless) numeric order of the ids themselves."""
+    letter_by_speaker: dict[str, str] = {}
+    lines: list[str] = []
+    for segment in labeled_segments:
+        speaker = segment.get("speaker") or "SPEAKER_UNKNOWN"
+        if speaker not in letter_by_speaker:
+            letter_by_speaker[speaker] = chr(ord("A") + len(letter_by_speaker))
+        text = (segment.get("text") or "").strip()
+        if not text:
+            continue
+        lines.append(f"[語者 {letter_by_speaker[speaker]}] {text}")
+    return "\n".join(lines)
+
+
+def _assemble_transcript(
+    segment_records: list[dict],
+    diarize_enabled: bool,
+    audio_path: str,
+    hf_token: str,
+    device: str,
+    progress_path: str | None,
+    filename: str,
+) -> tuple[str, str | None]:
+    """Build the (not yet OpenCC-converted) transcript text from whisper's
+    segments, optionally labeling it with speakers. Returns (transcript,
+    diarization_warning): diarization_warning is set only when diarization
+    was attempted and failed, in which case transcript is the plain
+    (unlabeled) text -- diarization failure SHALL NOT propagate out of this
+    function, per Diarization Failure Falls Back To Plain Transcript."""
+    plain_text = "".join(record["text"] for record in segment_records).strip()
+
+    if not diarize_enabled:
+        return plain_text, None
+
+    _write_progress(progress_path, {"phase": "diarizing", "file": filename, "percent": 0.0})
+    try:
+        labeled_segments = diarize_segments(audio_path, segment_records, hf_token=hf_token, device=device)
+    except Exception as exc:
+        return plain_text, str(exc)
+
+    return _format_diarized_transcript(labeled_segments), None
+
+
 def _start_heartbeat(
     progress_path: str, interval: float = HEARTBEAT_SECONDS
 ) -> threading.Event:
@@ -107,10 +168,14 @@ def main() -> int:
     # VAD silence skipping is on by default; --no-vad opts out (used when the
     # detector mistakes quiet speech for silence, e.g. far-field recordings).
     vad_filter = "--no-vad" not in args
-    args = [a for a in args if a != "--no-vad"]
+    # Speaker diarization is off by default; --diarize opts in (SPEAKER_DIARIZATION_ENABLED
+    # in .env). The Hugging Face token travels via an environment variable rather than a
+    # command-line argument so it never appears in process listings or logged commands.
+    diarize_enabled = "--diarize" in args
+    args = [a for a in args if a not in ("--no-vad", "--diarize")]
 
     if len(args) < 2:
-        print(json.dumps({"error": "usage: _transcribe_worker.py <audio_path> <model_size> [progress_file] [--no-vad]"}))
+        print(json.dumps({"error": "usage: _transcribe_worker.py <audio_path> <model_size> [progress_file] [--no-vad] [--diarize]"}))
         return 1
 
     audio_path, model_size = args[0], args[1]
@@ -136,10 +201,10 @@ def main() -> int:
         segments, info = model.transcribe(audio_path, vad_filter=vad_filter)
         duration = float(info.duration or 0)
 
-        parts: list[str] = []
+        segment_records: list[dict] = []
         last_write = 0.0
         for segment in segments:
-            parts.append(segment.text)
+            segment_records.append({"start": segment.start, "end": segment.end, "text": segment.text})
             now = time.monotonic()
             if now - last_write >= 2:
                 last_write = now
@@ -154,12 +219,19 @@ def main() -> int:
                         "percent": round(min(percent, 100.0), 1),
                     },
                 )
-        transcript = "".join(parts).strip()
+
+        hf_token = os.environ.get("HUGGINGFACE_TOKEN", "") if diarize_enabled else ""
+        device = _diarization_device() if diarize_enabled else "cpu"
+        transcript, diarization_warning = _assemble_transcript(
+            segment_records, diarize_enabled, audio_path, hf_token, device, progress_path, filename
+        )
 
         # Whisper's Chinese output script (simplified vs. traditional) is not
         # configurable and varies unpredictably between recordings even with
         # identical settings, so normalize to Taiwan-style traditional here
-        # rather than storing whatever the model happened to decode.
+        # rather than storing whatever the model happened to decode. Applied
+        # after diarization so the [語者 X] labels stay untouched (they are
+        # already Traditional Chinese) while the spoken text is normalized.
         from opencc import OpenCC
 
         transcript = OpenCC("s2twp").convert(transcript)
@@ -172,7 +244,10 @@ def main() -> int:
         progress_path,
         {"phase": "done", "file": filename, "duration_sec": duration, "percent": 100.0},
     )
-    print(json.dumps({"transcript": transcript}, ensure_ascii=False))
+    result_payload: dict = {"transcript": transcript}
+    if diarization_warning:
+        result_payload["diarization_warning"] = diarization_warning
+    print(json.dumps(result_payload, ensure_ascii=False))
     return 0
 
 

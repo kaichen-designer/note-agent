@@ -1,2 +1,3 @@
 faster-whisper>=1.2.1
 opencc-python-reimplemented>=0.1.7
+whisperx>=3.3.1

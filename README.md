@@ -90,13 +90,27 @@ notion-client 寫入 Notion「錄音筆記Agent」資料庫
 | `WHISPER_MODEL_SIZE` | 預設 large-v3 |
 | `VAD_FILTER` | 預設 true |
 | `MAX_RETRY_COUNT` | 預設 3 |
+| `SPEAKER_DIARIZATION_ENABLED` | 語者分離開關,預設 `false`(見下方「語者分離」說明) |
+| `HUGGINGFACE_TOKEN` | `SPEAKER_DIARIZATION_ENABLED=true` 時才需要,語者分離模型下載用 |
+
+## 語者分離(標註逐字稿裡「誰說的話」)
+
+多人討論的逐字稿預設沒有語者標記。需要分辨語者的錄音(例如訪談)可以手動開啟:
+
+1. 到 [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1) 與 [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0) 登入 Hugging Face 帳號並接受授權條款(一次性,兩個都要接受)
+2. 到 [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) 建立一組 token(read 權限即可),填入 `.env` 的 `HUGGINGFACE_TOKEN`
+3. 把 `.env` 的 `SPEAKER_DIARIZATION_ENABLED` 改成 `true`,跑一次 `run_now.bat` 處理要分析的錄音,跑完想關掉再改回 `false`
+
+啟用後,逐字稿裡每個語句片段會加上 `[語者 A]`、`[語者 B]` 這樣的前綴(依語者第一次開口的順序編號),**不是真實姓名**——語者分離只能判斷「這句和上一句是不是同一個人講的」,無法識別身分,標籤也是自動偵測,可能因為聲音重疊、背景雜訊等因素而誤判或錯亂,不保證逐字精準。
+
+這個開關是「執行當下」生效,不是針對單一檔案:如果開著的時候 watch 資料夾還有其他待處理的錄音,那些也會一起套用語者分離,並不會自動只挑訪談檔案。
 
 ## 已知限制與未來方向
 
-- **無語者分離**:多人討論的逐字稿沒有「誰說的」標記,重點抓取靠語意不受影響,但行動項目的負責人歸屬靠上下文推測;若實際使用發現歸屬錯誤造成困擾,可評估加入 pyannote/WhisperX(本地、免費,每檔多幾分鐘)
+- **語者分離不含身分辨識**:標籤只有「語者 A/B/C...」,無法對應到真實姓名,行動項目的負責人歸屬仍靠上下文推測(細節見上方「語者分離」說明)
 - **語音備忘錄需手動分享上傳**:Apple 不開放自動同步到第三方;可考慮 iOS 捷徑做一鍵錄音+上傳
 - **超長音檔未切割**:1 小時以上的錄音理論上可跑,但時間與記憶體未實測;必要時再開 change
-- **成本**:轉錄免費(本地);Claude 結構化每篇約 $0.01~0.05 美元;Notion API 免費
+- **成本**:轉錄免費(本地);Claude 結構化每篇約 $0.01~0.05 美元;Notion API 免費;語者分離同樣在本地執行,免費,但會延長處理時間
 
 ## 開發流程紀錄
 

@@ -1,3 +1,4 @@
+import os
 import sys
 import tempfile
 import unittest
@@ -27,6 +28,8 @@ CONFIG = {
     "notion_database_id": "unused",
     "max_retry_count": 3,
     "vad_filter": True,
+    "speaker_diarization_enabled": False,
+    "hf_token": "",
 }
 
 
@@ -88,6 +91,42 @@ class NotionWriteFailurePreservesTranscriptTests(unittest.TestCase):
         mock_transcribe_retry.assert_not_called()
         self.assertTrue(self.store.is_processed(file_id))
 
+
+
+class DiarizationConfigTests(unittest.TestCase):
+    """Local Speaker Diarization: enabling diarization without a Hugging
+    Face token is a configuration error, raised at startup before any
+    recording is processed; leaving diarization off (the default) does not
+    require the token at all."""
+
+    BASE_ENV = {
+        "WATCH_FOLDER_PATH": "C:/watch",
+        "ANTHROPIC_API_KEY": "sk-ant-test",
+        "NOTION_API_KEY": "ntn-test",
+        "NOTION_DATABASE_ID": "db-test",
+    }
+
+    def test_enabled_without_token_raises_configuration_error(self):
+        env = {**self.BASE_ENV, "SPEAKER_DIARIZATION_ENABLED": "true"}
+        with patch.object(main_module, "load_dotenv"), patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(SystemExit):
+                main_module._load_config()
+
+    def test_enabled_with_token_loads_successfully(self):
+        env = {
+            **self.BASE_ENV,
+            "SPEAKER_DIARIZATION_ENABLED": "true",
+            "HUGGINGFACE_TOKEN": "hf_test_token",
+        }
+        with patch.object(main_module, "load_dotenv"), patch.dict(os.environ, env, clear=True):
+            config = main_module._load_config()
+        self.assertTrue(config["speaker_diarization_enabled"])
+        self.assertEqual(config["hf_token"], "hf_test_token")
+
+    def test_disabled_by_default_does_not_require_token(self):
+        with patch.object(main_module, "load_dotenv"), patch.dict(os.environ, self.BASE_ENV, clear=True):
+            config = main_module._load_config()
+        self.assertFalse(config["speaker_diarization_enabled"])
 
 
 class SupportedRecordingExtensionTests(unittest.TestCase):

@@ -50,6 +50,80 @@ class WorkerHeartbeatTests(unittest.TestCase):
             self.assertFalse(self.progress.exists())
 
 
+class TranscriptAssemblyTests(unittest.TestCase):
+    """Local Speaker Diarization / Diarization Failure Falls Back To Plain
+    Transcript / Diarization Progress Reporting: worker._assemble_transcript()
+    assembles the final transcript with or without speaker prefixes, and a
+    diarization failure never propagates out -- it degrades to the plain
+    transcript with a warning message instead."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.progress = Path(self.tmpdir.name) / "progress.json"
+        self.segments = [
+            {"start": 0.0, "end": 1.0, "text": "請問你對這個題目的想法是?"},
+            {"start": 1.0, "end": 2.0, "text": "我覺得這個方向不錯。"},
+        ]
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def test_diarization_enabled_success_produces_speaker_prefixed_transcript(self):
+        labeled = [
+            {**self.segments[0], "speaker": "SPEAKER_00"},
+            {**self.segments[1], "speaker": "SPEAKER_01"},
+        ]
+        with patch.object(worker, "diarize_segments", return_value=labeled) as mock_diarize:
+            transcript, warning = worker._assemble_transcript(
+                self.segments,
+                diarize_enabled=True,
+                audio_path="interview.wav",
+                hf_token="hf_test_token",
+                device="cpu",
+                progress_path=str(self.progress),
+                filename="interview.wav",
+            )
+
+        self.assertIsNone(warning)
+        self.assertEqual(
+            transcript,
+            "[語者 A] 請問你對這個題目的想法是?\n[語者 B] 我覺得這個方向不錯。",
+        )
+        mock_diarize.assert_called_once_with(
+            "interview.wav", self.segments, hf_token="hf_test_token", device="cpu"
+        )
+        progress_payload = json.loads(self.progress.read_text(encoding="utf-8"))
+        self.assertEqual(progress_payload["phase"], "diarizing")
+
+    def test_diarization_disabled_preserves_plain_transcript(self):
+        transcript, warning = worker._assemble_transcript(
+            self.segments,
+            diarize_enabled=False,
+            audio_path="interview.wav",
+            hf_token="",
+            device="cpu",
+            progress_path=str(self.progress),
+            filename="interview.wav",
+        )
+        self.assertIsNone(warning)
+        self.assertEqual(transcript, "請問你對這個題目的想法是?我覺得這個方向不錯。")
+        self.assertFalse(self.progress.exists())
+
+    def test_diarization_failure_falls_back_to_plain_transcript(self):
+        with patch.object(worker, "diarize_segments", side_effect=RuntimeError("no token")):
+            transcript, warning = worker._assemble_transcript(
+                self.segments,
+                diarize_enabled=True,
+                audio_path="interview.wav",
+                hf_token="",
+                device="cpu",
+                progress_path=str(self.progress),
+                filename="interview.wav",
+            )
+        self.assertEqual(warning, "no token")
+        self.assertEqual(transcript, "請問你對這個題目的想法是?我覺得這個方向不錯。")
+
+
 class ViewerStatusTests(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
@@ -80,6 +154,19 @@ class ViewerStatusTests(unittest.TestCase):
         status = show_progress.read_status()
         self.assertIn("a.mkv", status)
         self.assertIn("50.0%", status)
+
+    def test_diarizing_phase_renders_status_instead_of_unknown(self):
+        self._write(
+            {
+                "phase": "diarizing",
+                "file": "interview.m4a",
+                "percent": 0.0,
+                "updated_at": time.time(),
+            }
+        )
+        status = show_progress.read_status()
+        self.assertIn("interview.m4a", status)
+        self.assertNotIn("狀態不明", status)
 
     def test_preparing_audio_phase_renders_explanation(self):
         self._write(

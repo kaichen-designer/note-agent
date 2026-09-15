@@ -11,6 +11,7 @@ can record the failure and keep processing other files.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,7 @@ class TranscriptionResult:
     success: bool
     transcript: str | None = None
     error: str | None = None
+    diarization_warning: str | None = None
 
 
 def build_worker_command(
@@ -31,14 +33,18 @@ def build_worker_command(
     model_size: str,
     progress_path: str | Path | None,
     vad_filter: bool,
+    diarization_enabled: bool = False,
 ) -> list[str]:
-    """Assemble the worker command line. VAD is the worker's default; only
-    the opt-out flag is passed so older invocations stay compatible."""
+    """Assemble the worker command line. VAD and diarization are the
+    worker's defaults; only the opt-in/opt-out flags are passed so older
+    invocations stay compatible."""
     command = [venv_python, str(_WORKER_SCRIPT), str(audio_path), model_size]
     if progress_path is not None:
         command.append(str(progress_path))
     if not vad_filter:
         command.append("--no-vad")
+    if diarization_enabled:
+        command.append("--diarize")
     return command
 
 
@@ -49,6 +55,8 @@ def transcribe_file(
     timeout_seconds: int = 3600,
     progress_path: str | Path | None = None,
     vad_filter: bool = True,
+    diarization_enabled: bool = False,
+    hf_token: str | None = None,
 ) -> TranscriptionResult:
     """Transcribe an audio file using the local faster-whisper worker.
 
@@ -58,11 +66,18 @@ def transcribe_file(
     When progress_path is given, the worker writes live progress there for
     the progress viewer. VAD silence skipping is on by default; pass
     vad_filter=False to transcribe the full audio including silence.
+
+    When diarization_enabled is True, hf_token is passed to the worker via
+    an environment variable (HUGGINGFACE_TOKEN) rather than a command-line
+    argument, so it never appears in a process listing or logged command.
     """
     resolved_venv_python = str(Path(venv_python).resolve())
     command = build_worker_command(
-        resolved_venv_python, audio_path, model_size, progress_path, vad_filter
+        resolved_venv_python, audio_path, model_size, progress_path, vad_filter, diarization_enabled
     )
+    env = None
+    if diarization_enabled:
+        env = {**os.environ, "HUGGINGFACE_TOKEN": hf_token or ""}
     try:
         completed = subprocess.run(
             command,
@@ -70,6 +85,7 @@ def transcribe_file(
             text=True,
             encoding="utf-8",
             timeout=timeout_seconds,
+            env=env,
         )
     except subprocess.TimeoutExpired:
         return TranscriptionResult(success=False, error=f"transcription timed out after {timeout_seconds}s")
@@ -91,4 +107,8 @@ def transcribe_file(
     if completed.returncode != 0 or "error" in payload:
         return TranscriptionResult(success=False, error=payload.get("error", "unknown transcription error"))
 
-    return TranscriptionResult(success=True, transcript=payload.get("transcript", ""))
+    return TranscriptionResult(
+        success=True,
+        transcript=payload.get("transcript", ""),
+        diarization_warning=payload.get("diarization_warning"),
+    )

@@ -116,6 +116,15 @@ def _load_config() -> dict:
         raise SystemExit(
             f"缺少必要設定:{', '.join(missing)}。請依 config/.env.example 建立 .env 並填入設定值。"
         )
+    speaker_diarization_enabled = os.environ.get("SPEAKER_DIARIZATION_ENABLED", "false").strip().lower() == "true"
+    hf_token = os.environ.get("HUGGINGFACE_TOKEN", "").strip()
+    if speaker_diarization_enabled and not hf_token:
+        raise SystemExit(
+            "SPEAKER_DIARIZATION_ENABLED=true 但缺少 HUGGINGFACE_TOKEN。"
+            "請依 README.md 的「語者分離」說明取得 token 並填入 .env,"
+            "或先把 SPEAKER_DIARIZATION_ENABLED 改回 false。"
+        )
+
     return {
         "watch_folder": os.environ["WATCH_FOLDER_PATH"],
         "anthropic_api_key": os.environ["ANTHROPIC_API_KEY"],
@@ -127,6 +136,8 @@ def _load_config() -> dict:
         "whisper_model_size": os.environ.get("WHISPER_MODEL_SIZE", "large-v3"),
         "max_retry_count": int(os.environ.get("MAX_RETRY_COUNT", "3")),
         "vad_filter": os.environ.get("VAD_FILTER", "true").strip().lower() != "false",
+        "speaker_diarization_enabled": speaker_diarization_enabled,
+        "hf_token": hf_token,
     }
 
 
@@ -146,11 +157,15 @@ def process_file(audio_path: Path, store: StateStore, config: dict, log: logging
             config["whisper_model_size"],
             progress_path=PROGRESS_PATH,
             vad_filter=config["vad_filter"],
+            diarization_enabled=config["speaker_diarization_enabled"],
+            hf_token=config["hf_token"],
         )
         if not result.success:
             store.mark_failed(file_id, f"轉錄失敗: {result.error}", config["max_retry_count"])
             log.error("轉錄失敗 (%s): %s", audio_path.name, result.error)
             return
+        if result.diarization_warning:
+            log.warning("語者分離失敗 (%s): %s", audio_path.name, result.diarization_warning)
         transcript = result.transcript
     else:
         log.info("使用先前保留的逐字稿,略過重新轉錄: %s", audio_path.name)

@@ -1,6 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -54,6 +55,95 @@ class WorkerCommandTests(unittest.TestCase):
         cmd = build_worker_command("py.exe", "a.m4a", "large-v3", None, vad_filter=False)
         self.assertIn("--no-vad", cmd)
         self.assertEqual(cmd[-1], "--no-vad")
+
+    def test_diarization_disabled_by_default_no_flag(self):
+        from transcribe import build_worker_command
+
+        cmd = build_worker_command("py.exe", "a.m4a", "large-v3", "prog.json", vad_filter=True)
+        self.assertNotIn("--diarize", cmd)
+
+    def test_diarization_enabled_appends_diarize_flag(self):
+        from transcribe import build_worker_command
+
+        cmd = build_worker_command(
+            "py.exe", "a.m4a", "large-v3", "prog.json", vad_filter=True, diarization_enabled=True
+        )
+        self.assertIn("--diarize", cmd)
+
+
+class _FakeCompletedProcess:
+    def __init__(self, stdout: str, returncode: int = 0, stderr: str = ""):
+        self.stdout = stdout
+        self.returncode = returncode
+        self.stderr = stderr
+
+
+class DiarizationPassthroughTests(unittest.TestCase):
+    """`src/transcribe.py`'s `transcribe_file()` new `diarization_enabled`/
+    `hf_token` parameters: the Hugging Face token travels to the worker via
+    an environment variable, not argv (Local Speaker Diarization design
+    decision: never let the token appear in a process command line)."""
+
+    def test_diarization_enabled_passes_diarize_flag_and_token_via_env(self):
+        captured = {}
+
+        def fake_run(command, **kwargs):
+            captured["command"] = command
+            captured["env"] = kwargs.get("env")
+            return _FakeCompletedProcess('{"transcript": "ok"}')
+
+        with patch("transcribe.subprocess.run", side_effect=fake_run):
+            result = transcribe_file(
+                "a.m4a",
+                venv_python="py.exe",
+                model_size="large-v3",
+                diarization_enabled=True,
+                hf_token="hf_secret_token",
+            )
+
+        self.assertTrue(result.success)
+        self.assertIn("--diarize", captured["command"])
+        self.assertNotIn("hf_secret_token", captured["command"])
+        self.assertEqual(captured["env"]["HUGGINGFACE_TOKEN"], "hf_secret_token")
+
+    def test_diarization_disabled_does_not_override_env(self):
+        captured = {}
+
+        def fake_run(command, **kwargs):
+            captured["env"] = kwargs.get("env")
+            return _FakeCompletedProcess('{"transcript": "ok"}')
+
+        with patch("transcribe.subprocess.run", side_effect=fake_run):
+            transcribe_file("a.m4a", venv_python="py.exe", model_size="large-v3")
+
+        self.assertIsNone(captured["env"])
+
+    def test_diarization_warning_in_worker_output_is_parsed_into_result(self):
+        def fake_run(command, **kwargs):
+            return _FakeCompletedProcess(
+                '{"transcript": "ok", "diarization_warning": "no token"}'
+            )
+
+        with patch("transcribe.subprocess.run", side_effect=fake_run):
+            result = transcribe_file(
+                "a.m4a",
+                venv_python="py.exe",
+                model_size="large-v3",
+                diarization_enabled=True,
+                hf_token="hf_secret_token",
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.diarization_warning, "no token")
+
+    def test_no_diarization_warning_defaults_to_none(self):
+        def fake_run(command, **kwargs):
+            return _FakeCompletedProcess('{"transcript": "ok"}')
+
+        with patch("transcribe.subprocess.run", side_effect=fake_run):
+            result = transcribe_file("a.m4a", venv_python="py.exe", model_size="large-v3")
+
+        self.assertIsNone(result.diarization_warning)
 
 
 if __name__ == "__main__":
