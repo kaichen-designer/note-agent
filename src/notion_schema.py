@@ -11,6 +11,17 @@ SOURCE_FILENAME_PROPERTY = "來源檔名"
 CATEGORY_TAG_PROPERTY = "分類標籤"
 STATUS_PROPERTY = "狀態"
 
-CATEGORY_TAG_OPTIONS = ["會議", "靈感", "學習", "其他"]
+# "其他" must stay the LAST entry: notion_agent.py's tolerant parser falls
+# back to CATEGORY_TAG_OPTIONS[-1] for an invalid/missing category, so
+# INTERVIEW_CATEGORY_TAG is inserted before it, not appended after.
+INTERVIEW_CATEGORY_TAG = "訪談"
+CATEGORY_TAG_OPTIONS = ["會議", "靈感", "學習", INTERVIEW_CATEGORY_TAG, "其他"]
+
+# The meeting structuring tool must never offer 訪談 as a selectable
+# category for Claude -- interviews are routed through interview_agent.py
+# entirely, so a meeting recording being tagged 訪談 would be a mistake, not
+# a legitimate choice.
+MEETING_CATEGORY_TAG_OPTIONS = [tag for tag in CATEGORY_TAG_OPTIONS if tag != INTERVIEW_CATEGORY_TAG]
+
 STATUS_OPTIONS = ["待處理", "已整理", "已完成"]
 DEFAULT_STATUS = "已整理"

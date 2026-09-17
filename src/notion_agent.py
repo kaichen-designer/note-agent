@@ -16,10 +16,10 @@ from notion_client import Client
 _log = logging.getLogger("pipeline")
 
 from notion_schema import (
-    CATEGORY_TAG_OPTIONS,
     CATEGORY_TAG_PROPERTY,
     DATE_PROPERTY,
     DEFAULT_STATUS,
+    MEETING_CATEGORY_TAG_OPTIONS,
     SOURCE_FILENAME_PROPERTY,
     STATUS_PROPERTY,
     TITLE_PROPERTY,
@@ -55,7 +55,7 @@ _STRUCTURE_TOOL = {
                     "in key_points, even if it was also discussed as a topic."
                 ),
             },
-            "category_tag": {"type": "string", "enum": CATEGORY_TAG_OPTIONS},
+            "category_tag": {"type": "string", "enum": MEETING_CATEGORY_TAG_OPTIONS},
         },
         "required": ["title", "summary", "key_points", "action_items", "category_tag"],
     },
@@ -108,7 +108,15 @@ def structure_note(
         # retries -- never accept a partially generated note.
         raise RuntimeError("structuring output truncated (stop_reason=max_tokens)")
     tool_use = next(block for block in message.content if block.type == "tool_use")
-    return parse_structured_note(tool_use.input, source_filename, transcript)
+    data = tool_use.input
+    if not (data.get("title") or data.get("summary") or data.get("key_points") or data.get("action_items")):
+        # All fields empty means Claude returned nothing usable (observed in
+        # production: page fell back to filename title + first-200-chars-of
+        # -raw-transcript summary + no headings, silently marked success).
+        # A single missing field is still tolerated below -- only a fully
+        # empty response is treated as a structuring failure.
+        raise RuntimeError("structuring output is empty (title/summary/key_points/action_items all missing)")
+    return parse_structured_note(data, source_filename, transcript)
 
 
 def parse_structured_note(data: dict, fallback_title: str, transcript: str) -> StructuredNote:
@@ -118,8 +126,8 @@ def parse_structured_note(data: dict, fallback_title: str, transcript: str) -> S
     with action_items); a missing optional-ish field must degrade gracefully
     instead of failing the whole recording."""
     category = data.get("category_tag")
-    if category not in CATEGORY_TAG_OPTIONS:
-        category = CATEGORY_TAG_OPTIONS[-1]  # fallback bucket: 其他
+    if category not in MEETING_CATEGORY_TAG_OPTIONS:
+        category = MEETING_CATEGORY_TAG_OPTIONS[-1]  # fallback bucket: 其他
 
     def _string_list(value) -> list[str]:
         if isinstance(value, list):

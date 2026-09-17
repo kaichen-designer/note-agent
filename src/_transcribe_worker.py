@@ -16,6 +16,7 @@ import os
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from diarize import diarize_segments
@@ -73,6 +74,73 @@ def _write_progress(progress_path: str | None, payload: dict) -> None:
             pass
 
 
+@dataclass
+class WorkerArgs:
+    audio_path: str
+    model_size: str
+    progress_path: str | None
+    vad_filter: bool
+    diarize_enabled: bool
+    keep_segments: bool
+    num_speakers: int | None = None
+
+
+def _parse_worker_args(argv: list[str]) -> WorkerArgs | None:
+    """Parse the worker's command line: <audio_path> <model_size>
+    [progress_file] [--no-vad] [--diarize] [--keep-segments]
+    [--num-speakers=N]. Returns None when the required positional arguments
+    are missing, so the caller can print the usage error and exit non-zero."""
+    num_speakers: int | None = None
+    args: list[str] = []
+    for a in argv:
+        if a in ("--no-vad", "--diarize", "--keep-segments"):
+            continue
+        if a.startswith("--num-speakers="):
+            num_speakers = int(a.split("=", 1)[1])
+            continue
+        args.append(a)
+    if len(args) < 2:
+        return None
+    return WorkerArgs(
+        audio_path=args[0],
+        model_size=args[1],
+        progress_path=args[2] if len(args) > 2 else None,
+        vad_filter="--no-vad" not in argv,
+        diarize_enabled="--diarize" in argv,
+        keep_segments="--keep-segments" in argv,
+        num_speakers=num_speakers,
+    )
+
+
+def _apply_text_conversion(segments: list[dict], convert) -> list[dict]:
+    """Run each segment's `text` through `convert` (e.g. OpenCC's
+    simplified->traditional normalizer), preserving every other key
+    unchanged. Applied to the --keep-segments payload so interview mode's
+    quotes/timestamps -- which read segment text directly, never the joined
+    transcript string -- get the same script normalization the transcript
+    already receives."""
+    return [{**segment, "text": convert(segment["text"])} for segment in segments]
+
+
+def _build_result_payload(
+    transcript: str,
+    diarization_warning: str | None,
+    segment_records: list[dict],
+    keep_segments: bool,
+) -> dict:
+    """Assemble the JSON payload printed to stdout. segment_records are
+    included verbatim (same start/end/text as faster-whisper produced, on
+    the original audio timeline) only when the caller opted in via
+    --keep-segments; the default shape is unchanged from before this flag
+    existed."""
+    payload: dict = {"transcript": transcript}
+    if diarization_warning:
+        payload["diarization_warning"] = diarization_warning
+    if keep_segments:
+        payload["segments"] = segment_records
+    return payload
+
+
 def _diarization_device() -> str:
     """Pick the diarization pipeline's device. whisperx pulls in torch as a
     transitive dependency, so this import is only safe once diarization is
@@ -85,21 +153,34 @@ def _diarization_device() -> str:
         return "cpu"
 
 
-def _format_diarized_transcript(labeled_segments: list[dict]) -> str:
-    """Turn whisperx/pyannote-labeled segments into the transcript text,
-    prefixing each segment with a `[語者 X]` label. Speaker letters are
-    assigned in the order each distinct diarization speaker id first
-    appears, not from the (meaningless) numeric order of the ids themselves."""
+def _assign_speaker_letters(labeled_segments: list[dict]) -> list[dict]:
+    """Convert each segment's raw diarization speaker id (e.g. SPEAKER_00)
+    into a letter label (A, B, C, ...) assigned in the order each distinct
+    id first appears, not from the (meaningless) numeric order of the ids
+    themselves. Returns new segment dicts with `speaker` replaced by the
+    letter, preserving `start`/`end`/`text`. This is the single source of
+    the letter assignment, reused both for the plain-text `[語者 X]` prefixes
+    and for any segments carrying a speaker label kept via --keep-segments,
+    so the two never disagree on which letter means which speaker."""
     letter_by_speaker: dict[str, str] = {}
-    lines: list[str] = []
+    lettered: list[dict] = []
     for segment in labeled_segments:
         speaker = segment.get("speaker") or "SPEAKER_UNKNOWN"
         if speaker not in letter_by_speaker:
             letter_by_speaker[speaker] = chr(ord("A") + len(letter_by_speaker))
+        lettered.append({**segment, "speaker": letter_by_speaker[speaker]})
+    return lettered
+
+
+def _format_diarized_transcript(lettered_segments: list[dict]) -> str:
+    """Turn letter-labeled segments (see _assign_speaker_letters) into the
+    transcript text, prefixing each segment with its `[語者 X]` label."""
+    lines: list[str] = []
+    for segment in lettered_segments:
         text = (segment.get("text") or "").strip()
         if not text:
             continue
-        lines.append(f"[語者 {letter_by_speaker[speaker]}] {text}")
+        lines.append(f"[語者 {segment['speaker']}] {text}")
     return "\n".join(lines)
 
 
@@ -111,25 +192,32 @@ def _assemble_transcript(
     device: str,
     progress_path: str | None,
     filename: str,
-) -> tuple[str, str | None]:
+    num_speakers: int | None = None,
+) -> tuple[str, str | None, list[dict] | None]:
     """Build the (not yet OpenCC-converted) transcript text from whisper's
     segments, optionally labeling it with speakers. Returns (transcript,
-    diarization_warning): diarization_warning is set only when diarization
-    was attempted and failed, in which case transcript is the plain
-    (unlabeled) text -- diarization failure SHALL NOT propagate out of this
-    function, per Diarization Failure Falls Back To Plain Transcript."""
+    diarization_warning, lettered_segments): diarization_warning is set only
+    when diarization was attempted and failed, in which case transcript is
+    the plain (unlabeled) text -- diarization failure SHALL NOT propagate
+    out of this function, per Diarization Failure Falls Back To Plain
+    Transcript. lettered_segments is the letter-labeled segment list (see
+    _assign_speaker_letters) when diarization succeeded, or None when
+    diarization was not enabled or failed."""
     plain_text = "".join(record["text"] for record in segment_records).strip()
 
     if not diarize_enabled:
-        return plain_text, None
+        return plain_text, None, None
 
     _write_progress(progress_path, {"phase": "diarizing", "file": filename, "percent": 0.0})
     try:
-        labeled_segments = diarize_segments(audio_path, segment_records, hf_token=hf_token, device=device)
+        labeled_segments = diarize_segments(
+            audio_path, segment_records, hf_token=hf_token, device=device, num_speakers=num_speakers
+        )
     except Exception as exc:
-        return plain_text, str(exc)
+        return plain_text, str(exc), None
 
-    return _format_diarized_transcript(labeled_segments), None
+    lettered_segments = _assign_speaker_letters(labeled_segments)
+    return _format_diarized_transcript(lettered_segments), None, lettered_segments
 
 
 def _start_heartbeat(
@@ -164,22 +252,24 @@ def _start_heartbeat(
 
 def main() -> int:
     _register_cuda_dll_dirs()
-    args = list(sys.argv[1:])
     # VAD silence skipping is on by default; --no-vad opts out (used when the
     # detector mistakes quiet speech for silence, e.g. far-field recordings).
-    vad_filter = "--no-vad" not in args
     # Speaker diarization is off by default; --diarize opts in (SPEAKER_DIARIZATION_ENABLED
     # in .env). The Hugging Face token travels via an environment variable rather than a
     # command-line argument so it never appears in process listings or logged commands.
-    diarize_enabled = "--diarize" in args
-    args = [a for a in args if a not in ("--no-vad", "--diarize")]
-
-    if len(args) < 2:
-        print(json.dumps({"error": "usage: _transcribe_worker.py <audio_path> <model_size> [progress_file] [--no-vad] [--diarize]"}))
+    # --keep-segments is off by default; only the interview pipeline passes it.
+    parsed_args = _parse_worker_args(sys.argv[1:])
+    if parsed_args is None:
+        print(json.dumps({"error": "usage: _transcribe_worker.py <audio_path> <model_size> [progress_file] [--no-vad] [--diarize] [--keep-segments] [--num-speakers=N]"}))
         return 1
 
-    audio_path, model_size = args[0], args[1]
-    progress_path = args[2] if len(args) > 2 else None
+    audio_path = parsed_args.audio_path
+    model_size = parsed_args.model_size
+    progress_path = parsed_args.progress_path
+    vad_filter = parsed_args.vad_filter
+    diarize_enabled = parsed_args.diarize_enabled
+    keep_segments = parsed_args.keep_segments
+    num_speakers = parsed_args.num_speakers
     filename = Path(audio_path).name
 
     try:
@@ -222,9 +312,21 @@ def main() -> int:
 
         hf_token = os.environ.get("HUGGINGFACE_TOKEN", "") if diarize_enabled else ""
         device = _diarization_device() if diarize_enabled else "cpu"
-        transcript, diarization_warning = _assemble_transcript(
-            segment_records, diarize_enabled, audio_path, hf_token, device, progress_path, filename
+        transcript, diarization_warning, lettered_segments = _assemble_transcript(
+            segment_records,
+            diarize_enabled,
+            audio_path,
+            hf_token,
+            device,
+            progress_path,
+            filename,
+            num_speakers=num_speakers,
         )
+        # Prefer the speaker-labeled segments (when diarization succeeded)
+        # for --keep-segments output, so interview timestamps carry the same
+        # [語者 X] letters as the plain-text transcript; fall back to the
+        # unlabeled segments when diarization was off or failed.
+        payload_segments = lettered_segments if lettered_segments is not None else segment_records
 
         # Whisper's Chinese output script (simplified vs. traditional) is not
         # configurable and varies unpredictably between recordings even with
@@ -232,9 +334,15 @@ def main() -> int:
         # rather than storing whatever the model happened to decode. Applied
         # after diarization so the [語者 X] labels stay untouched (they are
         # already Traditional Chinese) while the spoken text is normalized.
+        # Segment text is converted separately from the joined transcript
+        # string because interview mode reads segments directly (see
+        # main.py's process_interview_file), never the joined transcript.
         from opencc import OpenCC
 
-        transcript = OpenCC("s2twp").convert(transcript)
+        converter = OpenCC("s2twp")
+        transcript = converter.convert(transcript)
+        if payload_segments:
+            payload_segments = _apply_text_conversion(payload_segments, converter.convert)
     except Exception as exc:
         _write_progress(progress_path, {"phase": "failed", "file": filename, "error": str(exc)})
         print(json.dumps({"error": str(exc)}))
@@ -244,9 +352,9 @@ def main() -> int:
         progress_path,
         {"phase": "done", "file": filename, "duration_sec": duration, "percent": 100.0},
     )
-    result_payload: dict = {"transcript": transcript}
-    if diarization_warning:
-        result_payload["diarization_warning"] = diarization_warning
+    result_payload = _build_result_payload(
+        transcript, diarization_warning, payload_segments, keep_segments
+    )
     print(json.dumps(result_payload, ensure_ascii=False))
     return 0
 

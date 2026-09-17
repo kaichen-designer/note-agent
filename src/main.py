@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from interview_agent import create_interview_page, format_segments_with_timestamps, structure_interview
 from notion_agent import create_notion_page, structure_note
 from state_store import StateStore
 from transcribe import transcribe_file
@@ -32,7 +33,21 @@ LOG_PATH = DATA_DIR / "pipeline.log"
 LOCK_PATH = DATA_DIR / "pipeline.lock"
 PROGRESS_PATH = DATA_DIR / "transcribe_progress.json"
 
+# 訪談管線的狀態/快照檔案與會議管線完全分開存放,避免兩個資料夾若剛好出現
+# 同名同修改時間的檔案時,彼此的成功/失敗/重試紀錄互相污染
+# (Interview Processing State Isolation)。
+INTERVIEW_STATE_PATH = DATA_DIR / "interview_state.json"
+INTERVIEW_SNAPSHOT_PATH = DATA_DIR / "interview_scan_snapshot.json"
+
 AUDIO_EXTENSIONS = {".m4a", ".mp3", ".wav", ".aac", ".ogg", ".flac", ".wma", ".mp4", ".mkv"}
+
+
+def filter_supported_extensions(paths: list[Path]) -> list[Path]:
+    """Keep only files with a supported recording extension. Used for both
+    the meeting and interview watch folders -- there is no interview-specific
+    extension whitelist; which pipeline a file goes through is decided
+    entirely by which folder it was found in."""
+    return [path for path in paths if path.suffix.lower() in AUDIO_EXTENSIONS]
 
 PROCESSED_SUBFOLDER = "已處理"
 
@@ -125,8 +140,21 @@ def _load_config() -> dict:
             "或先把 SPEAKER_DIARIZATION_ENABLED 改回 false。"
         )
 
+    watch_folder = os.environ["WATCH_FOLDER_PATH"]
+    interview_watch_folder = os.environ.get("INTERVIEW_WATCH_FOLDER_PATH", "").strip() or None
+    if interview_watch_folder and _same_folder_path(interview_watch_folder, watch_folder):
+        raise SystemExit(
+            "INTERVIEW_WATCH_FOLDER_PATH 不可與 WATCH_FOLDER_PATH 設成相同路徑,"
+            "否則同一批檔案會被會議與訪談兩條管線重複處理。"
+        )
+
+    interview_expected_speakers_raw = os.environ.get("INTERVIEW_EXPECTED_SPEAKERS", "").strip()
+    interview_expected_speakers = int(interview_expected_speakers_raw) if interview_expected_speakers_raw else None
+
     return {
-        "watch_folder": os.environ["WATCH_FOLDER_PATH"],
+        "watch_folder": watch_folder,
+        "interview_watch_folder": interview_watch_folder,
+        "interview_expected_speakers": interview_expected_speakers,
         "anthropic_api_key": os.environ["ANTHROPIC_API_KEY"],
         "notion_api_key": os.environ["NOTION_API_KEY"],
         "notion_database_id": os.environ["NOTION_DATABASE_ID"],
@@ -139,6 +167,14 @@ def _load_config() -> dict:
         "speaker_diarization_enabled": speaker_diarization_enabled,
         "hf_token": hf_token,
     }
+
+
+def _same_folder_path(path_a: str, path_b: str) -> bool:
+    """Compare two configured folder paths for equality, tolerant of
+    trailing slashes and Windows path case-insensitivity, so a near-miss
+    (not just a byte-identical string) is still caught before it causes
+    duplicate processing."""
+    return os.path.normcase(os.path.normpath(path_a)) == os.path.normcase(os.path.normpath(path_b))
 
 
 def process_file(audio_path: Path, store: StateStore, config: dict, log: logging.Logger) -> None:
@@ -208,6 +244,122 @@ def process_file(audio_path: Path, store: StateStore, config: dict, log: logging
     archive_processed_file(audio_path, log)
 
 
+def process_interview_file(video_path: Path, store: StateStore, config: dict, log: logging.Logger) -> None:
+    """Interview counterpart of process_file: transcribes with segment
+    timestamps preserved, structures via interview_agent's pain-points/
+    highlights/usage-habits schema instead of the meeting schema, and writes
+    to Notion via create_interview_page. Shares the same lock/state/archive
+    plumbing as the meeting path.
+
+    The timestamped transcript text (not the raw segment list) is what gets
+    preserved in state for Notion Write Failure Handling retries, since
+    StateStore only persists a single transcript string; a retry that reuses
+    the preserved transcript has no segment list to validate against, so its
+    findings' timestamps degrade to "no valid timestamp" rather than failing.
+    """
+    file_id = StateStore.make_file_id(video_path.name, video_path.stat().st_mtime)
+    record = store.get(file_id)
+
+    transcript_with_timestamps = record.transcript if record and record.transcript else None
+    segments: list[dict] = []
+
+    if transcript_with_timestamps is None:
+        log.info("轉錄中(訪談): %s", video_path.name)
+        result = transcribe_file(
+            video_path,
+            config["transcribe_venv_python"],
+            config["whisper_model_size"],
+            progress_path=PROGRESS_PATH,
+            vad_filter=config["vad_filter"],
+            diarization_enabled=config["speaker_diarization_enabled"],
+            hf_token=config["hf_token"],
+            preserve_segments=True,
+            num_speakers=config["interview_expected_speakers"],
+        )
+        if not result.success:
+            store.mark_failed(file_id, f"轉錄失敗: {result.error}", config["max_retry_count"])
+            log.error("轉錄失敗(訪談) (%s): %s", video_path.name, result.error)
+            return
+        if result.diarization_warning:
+            log.warning("語者分離失敗(訪談) (%s): %s", video_path.name, result.diarization_warning)
+        segments = result.segments or []
+        transcript_with_timestamps = format_segments_with_timestamps(segments)
+    else:
+        log.info("使用先前保留的逐字稿,略過重新轉錄(訪談): %s", video_path.name)
+
+    recording_date = datetime.fromtimestamp(
+        video_path.stat().st_mtime, tz=timezone.utc
+    ).strftime("%Y-%m-%d")
+
+    try:
+        note = structure_interview(
+            transcript_with_timestamps,
+            video_path.name,
+            recording_date,
+            config["anthropic_api_key"],
+            segments,
+        )
+    except Exception as exc:
+        store.mark_failed(
+            file_id, f"結構化失敗: {exc}", config["max_retry_count"], transcript=transcript_with_timestamps
+        )
+        log.error("結構化失敗(訪談) (%s): %s", video_path.name, exc)
+        return
+
+    write_result = create_interview_page(
+        note,
+        transcript_with_timestamps,
+        video_path.name,
+        recording_date,
+        config["notion_database_id"],
+        config["notion_api_key"],
+    )
+    if not write_result.success:
+        store.mark_failed(
+            file_id,
+            f"Notion 寫入失敗: {write_result.error}",
+            config["max_retry_count"],
+            transcript=transcript_with_timestamps,
+        )
+        log.error("Notion 寫入失敗(訪談) (%s): %s", video_path.name, write_result.error)
+        return
+
+    store.mark_success(file_id)
+    log.info("完成(訪談): %s -> Notion page %s", video_path.name, write_result.page_id)
+    archive_processed_file(video_path, log)
+
+
+def _run_interview_pipeline(config: dict, log: logging.Logger) -> None:
+    """Scan and process the interview watch folder, independently of the
+    meeting watch folder (Independently Configured Interview Watch Folder /
+    Independent Watch Folder Support). A distinct pending-count log line
+    appears only when 2+ files are pending (Batch Interview Detection
+    Logging); a single pending file uses the meeting pipeline's general scan
+    log wording instead."""
+    interview_watch_folder = config["interview_watch_folder"]
+    if not interview_watch_folder:
+        log.info("訪談模式未啟用(未設定 INTERVIEW_WATCH_FOLDER_PATH)")
+        return
+
+    interview_store = StateStore(INTERVIEW_STATE_PATH)
+    to_process = filter_supported_extensions(
+        get_files_to_process(
+            interview_watch_folder, INTERVIEW_SNAPSHOT_PATH, interview_store, config["max_retry_count"]
+        )
+    )
+
+    if not to_process:
+        return
+
+    if len(to_process) >= 2:
+        log.info("本次有 %d 篇訪談待分析", len(to_process))
+    else:
+        log.info("本次掃描待處理 %d 個訪談檔案", len(to_process))
+
+    for video_path in to_process:
+        process_interview_file(video_path, interview_store, config, log)
+
+
 def main() -> int:
     log = _setup_logging()
 
@@ -219,21 +371,18 @@ def main() -> int:
         config = _load_config()
         store = StateStore(STATE_PATH)
 
-        to_process = [
-            path
-            for path in get_files_to_process(
-                config["watch_folder"], SNAPSHOT_PATH, store, config["max_retry_count"]
-            )
-            if path.suffix.lower() in AUDIO_EXTENSIONS
-        ]
+        to_process = filter_supported_extensions(
+            get_files_to_process(config["watch_folder"], SNAPSHOT_PATH, store, config["max_retry_count"])
+        )
 
         if not to_process:
             log.info("本次掃描沒有需要處理的錄音檔")
-            return 0
+        else:
+            log.info("本次掃描待處理 %d 個檔案", len(to_process))
+            for audio_path in to_process:
+                process_file(audio_path, store, config, log)
 
-        log.info("本次掃描待處理 %d 個檔案", len(to_process))
-        for audio_path in to_process:
-            process_file(audio_path, store, config, log)
+        _run_interview_pipeline(config, log)
 
         return 0
     finally:

@@ -110,6 +110,27 @@ class ParseStructuredNoteTests(unittest.TestCase):
         self.assertEqual(note.category_tag, "其他")
 
 
+class MeetingCategoryEnumExcludesInterviewTagTests(unittest.TestCase):
+    """notion_schema.CATEGORY_TAG_OPTIONS is shared with the interview
+    pipeline's Notion category tag, but the meeting structuring tool's enum
+    must never offer the interview-only "訪談" tag to Claude -- otherwise an
+    ordinary meeting recording could get mistagged as an interview. This
+    also guards the existing "falls back to 其他" behavior, which breaks if
+    「訪談」were ever appended after 其他 instead of before it."""
+
+    def test_structure_tool_enum_excludes_interview_tag(self):
+        from notion_agent import _STRUCTURE_TOOL
+        from notion_schema import INTERVIEW_CATEGORY_TAG
+
+        enum = _STRUCTURE_TOOL["input_schema"]["properties"]["category_tag"]["enum"]
+        self.assertNotIn(INTERVIEW_CATEGORY_TAG, enum)
+
+    def test_interview_tag_is_still_a_valid_database_option(self):
+        from notion_schema import CATEGORY_TAG_OPTIONS, INTERVIEW_CATEGORY_TAG
+
+        self.assertIn(INTERVIEW_CATEGORY_TAG, CATEGORY_TAG_OPTIONS)
+
+
 class TruncationRejectionTests(unittest.TestCase):
     """Truncated Structuring Output Rejection: a max_tokens-truncated
     response must raise (marking the file failed for retry), never be
@@ -154,6 +175,54 @@ class TruncationRejectionTests(unittest.TestCase):
             note = notion_agent.structure_note("逐字稿", "a.m4a", "2026-07-06", "key")
         self.assertEqual(note.title, "T")
         self.assertEqual(note.action_items, ["a"])
+
+
+class EmptyStructuringOutputRejectionTests(unittest.TestCase):
+    """Empty Structuring Output Rejection: a tool-call response where title,
+    summary, key_points, and action_items are all missing/empty must raise
+    (marking the file failed for retry), never be silently written to Notion
+    as a page with no real content (production: page fell back to filename
+    title + first-200-chars-of-raw-transcript summary + no headings)."""
+
+    def _fake_message(self, tool_input):
+        from unittest.mock import MagicMock
+
+        block = MagicMock()
+        block.type = "tool_use"
+        block.input = tool_input
+        message = MagicMock()
+        message.stop_reason = "tool_use"
+        message.content = [block]
+        return message
+
+    def test_all_fields_empty_raises(self):
+        from unittest.mock import MagicMock, patch
+
+        import notion_agent
+
+        fake = self._fake_message(
+            {"title": "", "summary": "", "key_points": [], "action_items": [], "category_tag": ""}
+        )
+        client = MagicMock()
+        client.messages.create.return_value = fake
+        with patch.object(notion_agent.anthropic, "Anthropic", return_value=client):
+            with self.assertRaises(RuntimeError):
+                notion_agent.structure_note("逐字稿", "a.m4a", "2026-07-06", "key")
+
+    def test_only_action_items_empty_parses_normally(self):
+        from unittest.mock import MagicMock, patch
+
+        import notion_agent
+
+        fake = self._fake_message(
+            {"title": "T", "summary": "S", "key_points": ["k"], "category_tag": "會議"}
+        )
+        client = MagicMock()
+        client.messages.create.return_value = fake
+        with patch.object(notion_agent.anthropic, "Anthropic", return_value=client):
+            note = notion_agent.structure_note("逐字稿", "a.m4a", "2026-07-06", "key")
+        self.assertEqual(note.title, "T")
+        self.assertEqual(note.action_items, [])
 
 
 class StringShapedListTests(unittest.TestCase):

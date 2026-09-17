@@ -11,5 +11,8 @@ data/pipeline.log
 data/transcribe_progress.json
 data/scan_snapshot.json
 data/pipeline.lock
+data/interview_state.json
+data/interview_scan_snapshot.json
+config/cookies.txt
 .claude/settings.local.json
 .claude/scheduled_tasks.lock

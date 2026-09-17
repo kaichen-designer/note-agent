@@ -1,3 +1,4 @@
+import logging
 import os
 import sys
 import tempfile
@@ -8,6 +9,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import main as main_module
+from interview_agent import InterviewNote
 from notion_agent import NotionWriteResult, StructuredNote
 from state_store import FAILED, StateStore
 from transcribe import TranscriptionResult
@@ -20,6 +22,10 @@ FAKE_NOTE = StructuredNote(
     category_tag="會議",
 )
 
+FAKE_INTERVIEW_NOTE = InterviewNote(
+    summary="訪談摘要", pain_points=[], highlights=[], usage_habits=[]
+)
+
 CONFIG = {
     "transcribe_venv_python": "unused",
     "whisper_model_size": "tiny",
@@ -30,6 +36,7 @@ CONFIG = {
     "vad_filter": True,
     "speaker_diarization_enabled": False,
     "hf_token": "",
+    "interview_expected_speakers": None,
 }
 
 
@@ -129,6 +136,47 @@ class DiarizationConfigTests(unittest.TestCase):
         self.assertFalse(config["speaker_diarization_enabled"])
 
 
+class InterviewWatchFolderConfigTests(unittest.TestCase):
+    """Independently Configured Interview Watch Folder: the interview watch
+    folder is optional and independent from the meeting watch folder; the two
+    paths must never be configured identically."""
+
+    BASE_ENV = {
+        "WATCH_FOLDER_PATH": "C:/watch",
+        "ANTHROPIC_API_KEY": "sk-ant-test",
+        "NOTION_API_KEY": "ntn-test",
+        "NOTION_DATABASE_ID": "db-test",
+    }
+
+    def test_not_configured_leaves_interview_watch_folder_none(self):
+        with patch.object(main_module, "load_dotenv"), patch.dict(os.environ, self.BASE_ENV, clear=True):
+            config = main_module._load_config()
+        self.assertIsNone(config["interview_watch_folder"])
+
+    def test_configured_to_same_path_as_meeting_folder_raises_configuration_error(self):
+        env = {**self.BASE_ENV, "INTERVIEW_WATCH_FOLDER_PATH": "C:/watch"}
+        with patch.object(main_module, "load_dotenv"), patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(SystemExit):
+                main_module._load_config()
+
+    def test_configured_to_different_path_is_loaded(self):
+        env = {**self.BASE_ENV, "INTERVIEW_WATCH_FOLDER_PATH": "C:/interviews"}
+        with patch.object(main_module, "load_dotenv"), patch.dict(os.environ, env, clear=True):
+            config = main_module._load_config()
+        self.assertEqual(config["interview_watch_folder"], "C:/interviews")
+
+    def test_expected_speakers_not_configured_defaults_to_none(self):
+        with patch.object(main_module, "load_dotenv"), patch.dict(os.environ, self.BASE_ENV, clear=True):
+            config = main_module._load_config()
+        self.assertIsNone(config["interview_expected_speakers"])
+
+    def test_expected_speakers_configured_is_parsed_as_int(self):
+        env = {**self.BASE_ENV, "INTERVIEW_EXPECTED_SPEAKERS": "2"}
+        with patch.object(main_module, "load_dotenv"), patch.dict(os.environ, env, clear=True):
+            config = main_module._load_config()
+        self.assertEqual(config["interview_expected_speakers"], 2)
+
+
 class SupportedRecordingExtensionTests(unittest.TestCase):
     """Video Container Recording Support: a stable .mkv file reaches the same
     scan-transcribe-structure-write pipeline as audio files, while other
@@ -164,6 +212,39 @@ class SupportedRecordingExtensionTests(unittest.TestCase):
         mov = self.folder / "meeting.mov"
         mov.write_bytes(b"fake mov container bytes")
         self.assertNotIn(mov, self._stable_supported_files())
+
+
+class InterviewFolderSupportedExtensionTests(unittest.TestCase):
+    """Interview folder file selection reuses the exact same
+    AUDIO_EXTENSIONS whitelist as the meeting folder -- there is no
+    interview-specific extension list; the folder path alone decides
+    meeting vs. interview."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.folder = Path(self.tmpdir.name)
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def _stable_supported_files(self):
+        snapshot_path = self.folder / "_snapshot.json"
+        store = StateStore(self.folder / "_state.json")
+        from watcher import get_files_to_process
+
+        get_files_to_process(self.folder, snapshot_path, store, max_retry_count=3)
+        candidates = get_files_to_process(self.folder, snapshot_path, store, max_retry_count=3)
+        return main_module.filter_supported_extensions(candidates)
+
+    def test_interview_folder_mp4_is_included(self):
+        mp4 = self.folder / "interview.mp4"
+        mp4.write_bytes(b"fake interview mp4 bytes")
+        self.assertIn(mp4, self._stable_supported_files())
+
+    def test_interview_folder_unsupported_extension_is_excluded(self):
+        txt = self.folder / "notes.txt"
+        txt.write_bytes(b"not a recording")
+        self.assertNotIn(txt, self._stable_supported_files())
 
 
 class PipelineLockTests(unittest.TestCase):
@@ -278,6 +359,183 @@ class ArchiveProcessedFileTests(unittest.TestCase):
             main_module.process_file(self.audio, self.store, CONFIG, self.log)
         self.assertTrue(self.audio.exists())
         self.assertFalse((self.folder / "已處理").exists())
+
+
+class ProcessInterviewFileTests(unittest.TestCase):
+    """Interview files route through structure_interview/create_interview_page,
+    never through the meeting pipeline's structure_note/create_notion_page --
+    and Notion Write Failure Handling applies the same way: the timestamped
+    transcript is preserved so a retry does not require re-transcription."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.folder = Path(self.tmpdir.name)
+        self.video = self.folder / "interview.mp4"
+        self.video.write_bytes(b"fake mp4 bytes")
+        self.store = StateStore(self.folder / "state.json")
+        self.log = logging.getLogger("test_pipeline_silent")
+        self.log.handlers = [logging.NullHandler()]
+        self.log.propagate = False
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def test_success_calls_interview_specific_functions(self):
+        file_id = StateStore.make_file_id(self.video.name, self.video.stat().st_mtime)
+        with (
+            patch.object(
+                main_module,
+                "transcribe_file",
+                return_value=TranscriptionResult(
+                    success=True,
+                    transcript="哈囉大家好我們開始訪談",
+                    segments=[{"start": 0.0, "end": 2.0, "text": "哈囉大家好我們開始訪談"}],
+                ),
+            ) as mock_transcribe,
+            patch.object(
+                main_module, "structure_interview", return_value=FAKE_INTERVIEW_NOTE
+            ) as mock_structure_interview,
+            patch.object(main_module, "structure_note") as mock_structure_note,
+            patch.object(
+                main_module,
+                "create_interview_page",
+                return_value=NotionWriteResult(success=True, page_id="page-interview-1"),
+            ) as mock_create_interview_page,
+            patch.object(main_module, "create_notion_page") as mock_create_notion_page,
+        ):
+            main_module.process_interview_file(self.video, self.store, CONFIG, self.log)
+
+        mock_transcribe.assert_called_once()
+        self.assertTrue(mock_transcribe.call_args.kwargs["preserve_segments"])
+        self.assertIsNone(mock_transcribe.call_args.kwargs.get("num_speakers"))
+        mock_structure_interview.assert_called_once()
+        mock_create_interview_page.assert_called_once()
+        mock_structure_note.assert_not_called()
+        mock_create_notion_page.assert_not_called()
+
+        self.assertTrue(self.store.is_processed(file_id))
+
+    def test_expected_speakers_config_is_forwarded_to_transcribe(self):
+        """Expected Speaker Count Hint: when INTERVIEW_EXPECTED_SPEAKERS is
+        configured, process_interview_file passes it through to
+        transcribe_file so diarization can be constrained instead of
+        auto-detecting (and potentially over-segmenting) the speaker count."""
+        config_with_hint = {**CONFIG, "interview_expected_speakers": 2}
+        with (
+            patch.object(
+                main_module,
+                "transcribe_file",
+                return_value=TranscriptionResult(
+                    success=True,
+                    transcript="逐字稿",
+                    segments=[{"start": 0.0, "end": 1.0, "text": "逐字稿"}],
+                ),
+            ) as mock_transcribe,
+            patch.object(main_module, "structure_interview", return_value=FAKE_INTERVIEW_NOTE),
+            patch.object(
+                main_module,
+                "create_interview_page",
+                return_value=NotionWriteResult(success=True, page_id="page-interview-hint"),
+            ),
+        ):
+            main_module.process_interview_file(self.video, self.store, config_with_hint, self.log)
+
+        self.assertEqual(mock_transcribe.call_args.kwargs.get("num_speakers"), 2)
+
+    def test_write_failure_preserves_transcript_and_retry_skips_transcription(self):
+        with (
+            patch.object(
+                main_module,
+                "transcribe_file",
+                return_value=TranscriptionResult(
+                    success=True,
+                    transcript="逐字稿",
+                    segments=[{"start": 0.0, "end": 1.0, "text": "逐字稿"}],
+                ),
+            ) as mock_transcribe,
+            patch.object(main_module, "structure_interview", return_value=FAKE_INTERVIEW_NOTE),
+            patch.object(
+                main_module,
+                "create_interview_page",
+                return_value=NotionWriteResult(success=False, error="invalid database id"),
+            ),
+        ):
+            main_module.process_interview_file(self.video, self.store, CONFIG, self.log)
+
+        file_id = StateStore.make_file_id(self.video.name, self.video.stat().st_mtime)
+        record = self.store.get(file_id)
+        self.assertEqual(record.status, FAILED)
+        self.assertIsNotNone(record.transcript)
+        self.assertEqual(mock_transcribe.call_count, 1)
+
+        with (
+            patch.object(main_module, "transcribe_file") as mock_transcribe_retry,
+            patch.object(main_module, "structure_interview", return_value=FAKE_INTERVIEW_NOTE),
+            patch.object(
+                main_module,
+                "create_interview_page",
+                return_value=NotionWriteResult(success=True, page_id="page-interview-2"),
+            ),
+        ):
+            main_module.process_interview_file(self.video, self.store, CONFIG, self.log)
+
+        mock_transcribe_retry.assert_not_called()
+        self.assertTrue(self.store.is_processed(file_id))
+
+
+class InterviewBatchLoggingTests(unittest.TestCase):
+    """Batch Interview Detection Logging: a distinct "N 篇訪談待分析" line
+    appears only when 2+ interview files are pending; a single pending file
+    uses the same general scan-log format as the meeting pipeline, and an
+    unconfigured interview folder logs that interview mode is not enabled."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.folder = Path(self.tmpdir.name)
+        self._original_state_path = main_module.INTERVIEW_STATE_PATH
+        main_module.INTERVIEW_STATE_PATH = self.folder / "interview_state.json"
+
+    def tearDown(self):
+        main_module.INTERVIEW_STATE_PATH = self._original_state_path
+        self.tmpdir.cleanup()
+
+    def _run_with_fake_pending(self, filenames):
+        fake_paths = [self.folder / name for name in filenames]
+        for path in fake_paths:
+            path.write_bytes(b"x")
+        config = {**CONFIG, "interview_watch_folder": str(self.folder)}
+        log = logging.getLogger("test_pipeline_batch_log")
+        log.propagate = True
+        with (
+            patch.object(main_module, "get_files_to_process", return_value=fake_paths),
+            patch.object(main_module, "process_interview_file") as mock_process,
+            self.assertLogs(log, level="INFO") as captured,
+        ):
+            main_module._run_interview_pipeline(config, log)
+        return captured.output, mock_process
+
+    def test_not_configured_logs_not_enabled(self):
+        config = {**CONFIG, "interview_watch_folder": None}
+        log = logging.getLogger("test_pipeline_batch_log_unset")
+        log.propagate = True
+        with (
+            patch.object(main_module, "process_interview_file") as mock_process,
+            self.assertLogs(log, level="INFO") as captured,
+        ):
+            main_module._run_interview_pipeline(config, log)
+        self.assertTrue(any("未啟用" in line for line in captured.output))
+        mock_process.assert_not_called()
+
+    def test_single_pending_file_uses_general_log_format_not_batch_wording(self):
+        output, mock_process = self._run_with_fake_pending(["interview.mp4"])
+        self.assertTrue(any("1" in line and "訪談" in line for line in output))
+        self.assertFalse(any("待分析" in line for line in output))
+        mock_process.assert_called_once()
+
+    def test_multiple_pending_files_logs_batch_count(self):
+        output, mock_process = self._run_with_fake_pending(["a.mp4", "b.mp4", "c.mp4"])
+        self.assertTrue(any("3" in line and "待分析" in line for line in output))
+        self.assertEqual(mock_process.call_count, 3)
 
 
 if __name__ == "__main__":

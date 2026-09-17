@@ -83,3 +83,18 @@ The system SHALL treat a structuring response whose stop_reason is max_tokens as
 
 - **WHEN** the structuring API response completes without hitting the token limit
 - **THEN** the note SHALL be parsed with the existing tolerant parser and written to Notion
+
+---
+### Requirement: Empty Structuring Output Rejection
+
+The system SHALL treat a structuring response whose title, summary, key_points, and action_items are all missing or empty as a structuring failure, raising an error so the recording is marked failed and retried, instead of silently writing a Notion page with a filename-derived title and a raw-transcript-slice summary. A response missing only some of these fields SHALL continue to degrade gracefully via the existing tolerant parser.
+
+#### Scenario: Fully empty response triggers failure and retry
+
+- **WHEN** the structuring API response's tool-call input has no title, no summary, no key_points, and no action_items
+- **THEN** the structuring step SHALL raise an error, and the pipeline SHALL record the recording as failed with the transcript preserved for retry
+
+#### Scenario: Partially empty response still parses normally
+
+- **WHEN** the structuring API response is missing only some fields (for example, action_items alone)
+- **THEN** the note SHALL be parsed with the existing tolerant parser, degrading only the missing fields to their defaults

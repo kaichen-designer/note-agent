@@ -42,6 +42,20 @@ class WorkerCommandTests(unittest.TestCase):
     """Silence Skipping Via Voice Activity Detection: the worker command
     carries the opt-out flag only when VAD is disabled."""
 
+    def test_num_speakers_not_given_omits_flag(self):
+        from transcribe import build_worker_command
+
+        cmd = build_worker_command("py.exe", "a.m4a", "large-v3", "prog.json", vad_filter=True)
+        self.assertFalse(any(arg.startswith("--num-speakers=") for arg in cmd))
+
+    def test_num_speakers_given_appends_flag(self):
+        from transcribe import build_worker_command
+
+        cmd = build_worker_command(
+            "py.exe", "a.m4a", "large-v3", "prog.json", vad_filter=True, num_speakers=2
+        )
+        self.assertIn("--num-speakers=2", cmd)
+
     def test_vad_enabled_by_default_no_flag(self):
         from transcribe import build_worker_command
 
@@ -76,6 +90,56 @@ class _FakeCompletedProcess:
         self.stdout = stdout
         self.returncode = returncode
         self.stderr = stderr
+
+
+class SegmentTimestampPreservationTests(unittest.TestCase):
+    """Segment Timestamp Preservation On Request: preserve_segments is an
+    opt-in flag that, when set, carries per-segment start/end timestamps
+    through to the caller; when unset, behavior (including the worker
+    command line) is unchanged from before this flag existed."""
+
+    def test_preserve_segments_appends_keep_segments_flag(self):
+        from transcribe import build_worker_command
+
+        cmd = build_worker_command(
+            "py.exe", "a.m4a", "large-v3", "prog.json", vad_filter=True, preserve_segments=True
+        )
+        self.assertIn("--keep-segments", cmd)
+
+    def test_preserve_segments_not_requested_omits_flag(self):
+        from transcribe import build_worker_command
+
+        cmd = build_worker_command("py.exe", "a.m4a", "large-v3", "prog.json", vad_filter=True)
+        self.assertNotIn("--keep-segments", cmd)
+
+    def test_segments_requested_are_parsed_into_result(self):
+        def fake_run(command, **kwargs):
+            return _FakeCompletedProcess(
+                '{"transcript": "ok", "segments": '
+                '[{"start": 0.0, "end": 1.5, "text": "hello"}, '
+                '{"start": 1.5, "end": 3.2, "text": "world"}]}'
+            )
+
+        with patch("transcribe.subprocess.run", side_effect=fake_run):
+            result = transcribe_file(
+                "a.m4a", venv_python="py.exe", model_size="large-v3", preserve_segments=True
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(
+            result.segments,
+            [{"start": 0.0, "end": 1.5, "text": "hello"}, {"start": 1.5, "end": 3.2, "text": "world"}],
+        )
+
+    def test_segments_not_requested_result_has_none(self):
+        def fake_run(command, **kwargs):
+            return _FakeCompletedProcess('{"transcript": "ok"}')
+
+        with patch("transcribe.subprocess.run", side_effect=fake_run):
+            result = transcribe_file("a.m4a", venv_python="py.exe", model_size="large-v3")
+
+        self.assertTrue(result.success)
+        self.assertIsNone(result.segments)
 
 
 class DiarizationPassthroughTests(unittest.TestCase):

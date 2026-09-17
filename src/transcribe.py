@@ -25,6 +25,7 @@ class TranscriptionResult:
     transcript: str | None = None
     error: str | None = None
     diarization_warning: str | None = None
+    segments: list[dict] | None = None
 
 
 def build_worker_command(
@@ -34,10 +35,12 @@ def build_worker_command(
     progress_path: str | Path | None,
     vad_filter: bool,
     diarization_enabled: bool = False,
+    preserve_segments: bool = False,
+    num_speakers: int | None = None,
 ) -> list[str]:
-    """Assemble the worker command line. VAD and diarization are the
-    worker's defaults; only the opt-in/opt-out flags are passed so older
-    invocations stay compatible."""
+    """Assemble the worker command line. VAD, diarization, and segment
+    preservation are the worker's defaults; only the opt-in/opt-out flags are
+    passed so older invocations stay compatible."""
     command = [venv_python, str(_WORKER_SCRIPT), str(audio_path), model_size]
     if progress_path is not None:
         command.append(str(progress_path))
@@ -45,6 +48,10 @@ def build_worker_command(
         command.append("--no-vad")
     if diarization_enabled:
         command.append("--diarize")
+    if preserve_segments:
+        command.append("--keep-segments")
+    if num_speakers is not None:
+        command.append(f"--num-speakers={num_speakers}")
     return command
 
 
@@ -57,6 +64,8 @@ def transcribe_file(
     vad_filter: bool = True,
     diarization_enabled: bool = False,
     hf_token: str | None = None,
+    preserve_segments: bool = False,
+    num_speakers: int | None = None,
 ) -> TranscriptionResult:
     """Transcribe an audio file using the local faster-whisper worker.
 
@@ -70,10 +79,28 @@ def transcribe_file(
     When diarization_enabled is True, hf_token is passed to the worker via
     an environment variable (HUGGINGFACE_TOKEN) rather than a command-line
     argument, so it never appears in a process listing or logged command.
+
+    preserve_segments is opt-in (default False): only the interview pipeline
+    sets it, so the meeting pipeline's output stays byte-identical to before
+    this flag existed. When True, the result's segments field carries each
+    whisper segment's start/end timestamps alongside the assembled
+    transcript text.
+
+    num_speakers is an optional hint (e.g. 2 for a 1-on-1 interview) for how
+    many distinct speakers diarization should expect; without it, pyannote
+    auto-detects the count, which can over-segment one speaker's voice into
+    multiple speaker labels.
     """
     resolved_venv_python = str(Path(venv_python).resolve())
     command = build_worker_command(
-        resolved_venv_python, audio_path, model_size, progress_path, vad_filter, diarization_enabled
+        resolved_venv_python,
+        audio_path,
+        model_size,
+        progress_path,
+        vad_filter,
+        diarization_enabled,
+        preserve_segments,
+        num_speakers,
     )
     env = None
     if diarization_enabled:
@@ -111,4 +138,5 @@ def transcribe_file(
         success=True,
         transcript=payload.get("transcript", ""),
         diarization_warning=payload.get("diarization_warning"),
+        segments=payload.get("segments"),
     )
