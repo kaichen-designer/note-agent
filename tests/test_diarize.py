@@ -52,8 +52,34 @@ class DiarizeSegmentsSuccessTests(unittest.TestCase):
 
         self.assertEqual(result[0]["speaker"], "SPEAKER_00")
         self.assertEqual(result[1]["speaker"], "SPEAKER_01")
-        mock_pipeline_factory.assert_called_once_with(use_auth_token="hf_test_token", device="cpu")
-        mock_pipeline_instance.assert_called_once_with("interview.wav")
+        mock_pipeline_factory.assert_called_once_with(
+            model_name="pyannote/speaker-diarization-3.1", token="hf_test_token", device="cpu"
+        )
+        mock_pipeline_instance.assert_called_once_with("interview.wav", num_speakers=None)
+
+    def test_num_speakers_hint_is_forwarded_to_pipeline_call(self):
+        """Expected Speaker Count Hint: when the caller knows how many
+        speakers are actually in the recording (e.g. a 1-on-1 interview),
+        passing num_speakers constrains the diarization pipeline instead of
+        letting it auto-detect and potentially over-segment one speaker's
+        voice into multiple speaker labels."""
+        labeled = [{"start": 0.0, "end": 1.0, "text": "hi", "speaker": "SPEAKER_00"}]
+        mock_pipeline_instance = MagicMock(return_value="diarize_df_sentinel")
+        mock_pipeline_factory = MagicMock(return_value=mock_pipeline_instance)
+        mock_assign_word_speakers = MagicMock(return_value={"segments": labeled})
+
+        with _install_fake_whisperx(mock_pipeline_factory, mock_assign_word_speakers):
+            from diarize import diarize_segments
+
+            diarize_segments(
+                "interview.wav",
+                [{"start": 0.0, "end": 1.0, "text": "hi"}],
+                hf_token="hf_test_token",
+                device="cpu",
+                num_speakers=2,
+            )
+
+        mock_pipeline_instance.assert_called_once_with("interview.wav", num_speakers=2)
 
 
 class DiarizeSegmentsFailureTests(unittest.TestCase):

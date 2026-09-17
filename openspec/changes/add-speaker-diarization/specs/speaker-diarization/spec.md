@@ -28,6 +28,17 @@ The system SHALL support labeling transcript segments with a speaker identifier 
 
 ---
 
+### Requirement: Meeting Recordings Never Use Diarization
+
+The system SHALL NOT run speaker diarization on recordings from the meeting watch folder (`WATCH_FOLDER_PATH`), regardless of the `SPEAKER_DIARIZATION_ENABLED` value. Diarization SHALL only ever apply to recordings from the interview watch folder (`INTERVIEW_WATCH_FOLDER_PATH`).
+
+#### Scenario: Meeting recording transcribed with diarization enabled globally
+
+- **WHEN** a recording from the meeting watch folder is transcribed while `SPEAKER_DIARIZATION_ENABLED=true`
+- **THEN** the resulting transcript text SHALL contain no speaker labels, identical to the diarization-disabled output
+
+---
+
 ### Requirement: Diarization Failure Falls Back To Plain Transcript
 
 The system SHALL NOT allow a failure in the speaker diarization step (for example, model download failure, an invalid or expired Hugging Face token, or a runtime error in the diarization pipeline) to cause the overall transcription to fail. On diarization failure, the system SHALL fall back to producing the plain transcript text without speaker labels, and SHALL record a warning describing the failure in the pipeline log.

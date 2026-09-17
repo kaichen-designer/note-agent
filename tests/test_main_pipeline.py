@@ -99,6 +99,41 @@ class NotionWriteFailurePreservesTranscriptTests(unittest.TestCase):
         self.assertTrue(self.store.is_processed(file_id))
 
 
+class MeetingDiarizationDisabledTests(unittest.TestCase):
+    """Meeting recordings never need speaker diarization (unlike interviews);
+    the meeting pipeline must not request it even when
+    SPEAKER_DIARIZATION_ENABLED=true for the interview pipeline."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.folder = Path(self.tmpdir.name)
+        self.audio = self.folder / "meeting.m4a"
+        self.audio.write_bytes(b"fake audio")
+        self.store = StateStore(self.folder / "state.json")
+        self.log = logging.getLogger("test_pipeline_silent_meeting_diarization")
+        self.log.handlers = [logging.NullHandler()]
+        self.log.propagate = False
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def test_process_file_never_requests_diarization_even_when_enabled_in_config(self):
+        config = {**CONFIG, "speaker_diarization_enabled": True, "hf_token": "hf_test_token"}
+        with (
+            patch.object(
+                main_module,
+                "transcribe_file",
+                return_value=TranscriptionResult(success=True, transcript="逐字稿內容"),
+            ) as mock_transcribe,
+            patch.object(main_module, "structure_note", return_value=FAKE_NOTE),
+            patch.object(
+                main_module, "create_notion_page", return_value=NotionWriteResult(success=True, page_id="p1")
+            ),
+        ):
+            main_module.process_file(self.audio, self.store, config, self.log)
+
+        self.assertFalse(mock_transcribe.call_args.kwargs.get("diarization_enabled", False))
+
 
 class DiarizationConfigTests(unittest.TestCase):
     """Local Speaker Diarization: enabling diarization without a Hugging

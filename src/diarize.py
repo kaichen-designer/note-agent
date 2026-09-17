@@ -23,7 +23,12 @@ from __future__ import annotations
 
 
 def diarize_segments(
-    audio_path: str, segments: list[dict], *, hf_token: str, device: str
+    audio_path: str,
+    segments: list[dict],
+    *,
+    hf_token: str,
+    device: str,
+    num_speakers: int | None = None,
 ) -> list[dict]:
     """Label each segment with a `speaker` field.
 
@@ -31,10 +36,26 @@ def diarize_segments(
     (as produced by faster-whisper). Returns the equivalent list with a
     `speaker` key added to each segment (e.g. "SPEAKER_00"), in the same
     order as the input.
+
+    num_speakers is an optional hint for how many distinct speakers are
+    actually in the recording (e.g. 2 for a 1-on-1 interview). Without it,
+    pyannote auto-detects the speaker count, which can over-segment a single
+    speaker's voice into multiple labels when tone/background noise varies
+    (observed in production). Passing the known count constrains the
+    pipeline instead.
     """
     import whisperx
+    import whisperx.diarize  # newer whisperx does not expose `diarize` as a `whisperx` attribute via plain `import whisperx`
 
-    diarize_model = whisperx.diarize.DiarizationPipeline(use_auth_token=hf_token, device=device)
-    diarization = diarize_model(audio_path)
+    # Pin the pipeline explicitly: whisperx's own default model has changed
+    # between versions (observed: newer releases default to
+    # pyannote/speaker-diarization-community-1, a separately-gated model),
+    # so relying on the library's default silently breaks access for anyone
+    # who only accepted the license for speaker-diarization-3.1 (the model
+    # README.md/.env.example instruct users to accept).
+    diarize_model = whisperx.diarize.DiarizationPipeline(
+        model_name="pyannote/speaker-diarization-3.1", token=hf_token, device=device
+    )
+    diarization = diarize_model(audio_path, num_speakers=num_speakers)
     result = whisperx.assign_word_speakers(diarization, {"segments": segments})
     return result["segments"]

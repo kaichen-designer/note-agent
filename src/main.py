@@ -187,14 +187,16 @@ def process_file(audio_path: Path, store: StateStore, config: dict, log: logging
 
     if transcript is None:
         log.info("轉錄中: %s", audio_path.name)
+        # Meeting recordings never need speaker diarization (unlike
+        # interviews) -- diarization_enabled/hf_token are deliberately not
+        # forwarded from config here, even when SPEAKER_DIARIZATION_ENABLED
+        # is true for the interview pipeline.
         result = transcribe_file(
             audio_path,
             config["transcribe_venv_python"],
             config["whisper_model_size"],
             progress_path=PROGRESS_PATH,
             vad_filter=config["vad_filter"],
-            diarization_enabled=config["speaker_diarization_enabled"],
-            hf_token=config["hf_token"],
         )
         if not result.success:
             store.mark_failed(file_id, f"轉錄失敗: {result.error}", config["max_retry_count"])

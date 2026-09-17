@@ -29,3 +29,9 @@
 
 - [x] 5.1 執行完整測試套件確認沒有既有測試因本次變更而迴歸失敗 —— 驗證:`pytest` 於專案根目錄執行,全數通過
 - [ ] 5.2 依 design.md 的驗收標準,以一段已知雙語者的錄音手動跑一次(啟用 `SPEAKER_DIARIZATION_ENABLED` 與有效 `HUGGINGFACE_TOKEN`),確認 Notion 頁面逐字稿 toggle 區塊出現 `[語者 A]`/`[語者 B]` 前綴且與實際發言者大致對應;再關閉功能重跑同一份錄音,確認逐字稿格式與變更前完全一致 —— 驗證:人工比對兩次執行產生的 Notion 頁面內容差異
+
+## 6. 會議管線永不做語者分離(需求變更後追加)
+
+- [x] 6.1 `src/main.py` 的 `process_file()`(會議路徑)呼叫 `transcribe_file()` 時不再傳入 `diarization_enabled`/`hf_token`,一律使用函式預設值(不啟用),即使 `SPEAKER_DIARIZATION_ENABLED=true` 也不影響會議資料夾(`WATCH_FOLDER_PATH`)的錄音;`process_interview_file()`(訪談路徑)不受影響,仍依 `config["speaker_diarization_enabled"]` 決定(Meeting Recordings Never Use Diarization requirement)。驗證:`tests/test_main_pipeline.py` 新增 `MeetingDiarizationDisabledTests`,確認即使 config 裡 `speaker_diarization_enabled=True`,`process_file()` 呼叫 `transcribe_file()` 時 `diarization_enabled` 仍為 False。
+- [x] 6.2 更新 `config/.env.example` 的 `SPEAKER_DIARIZATION_ENABLED` 註解,說明此設定只影響訪談資料夾,不需要為了會議另外開關。驗證:檢視 `.env.example` 對應段落內容已更新。
+- [x] 6.3 執行完整測試套件,確認第 6 節新增測試與既有全部測試皆通過。驗證:`pytest` 執行結果全部 PASS(136 個測試)。
